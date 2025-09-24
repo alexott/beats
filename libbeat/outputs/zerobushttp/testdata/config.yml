@@ -1,0 +1,17 @@
+# Test configuration for ZeroBus HTTP output
+output.zerobushttp:
+  zerobus_uri: "test-workspace.ingest.cloud.databricks.com"
+  table_name: "unity.default.air_quality"
+  pat_token: "test-pat-token"
+  workspace_url: "https://test-workspace.cloud.databricks.com"
+  timeout: 30s
+  batch_size: 1
+  headers:
+    X-Test-Header: "test-value"
+    X-Environment: "test"
+  retry:
+    max: 3
+    backoff: 1s
+  codec.json:
+    pretty: false
+    escape_html: false
