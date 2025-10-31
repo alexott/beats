@@ -23,8 +23,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
+	"golang.org/x/net/http2"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
 
@@ -121,9 +123,9 @@ func newZeroBusHttp(
 	}
 
 	if usingOAuth {
-		output.log.Infof("Initialized ZeroBus HTTP output for table: %s (using OAuth M2M authentication)", config.TableName)
+		output.log.Infof("Initialized ZeroBus HTTP output for table: %s (using OAuth M2M authentication, %d workers)", config.TableName, config.Workers)
 	} else {
-		output.log.Warnf("Initialized ZeroBus HTTP output for table: %s (using PAT token - deprecated, please migrate to OAuth)", config.TableName)
+		output.log.Warnf("Initialized ZeroBus HTTP output for table: %s (using PAT token - deprecated, please migrate to OAuth, %d workers)", config.TableName, config.Workers)
 	}
 	return output, nil
 }
@@ -140,12 +142,108 @@ func (o *zerobushttpOutput) Publish(ctx context.Context, batch publisher.Batch) 
 	events := batch.Events()
 	st.NewBatch(len(events))
 
+	// If only one event or workers is 1, use sequential processing
+	if len(events) == 1 || o.config.Workers == 1 {
+		return o.publishSequential(ctx, batch, events, st)
+	}
+
+	// Use parallel processing with worker pool
+	return o.publishParallel(ctx, batch, events, st)
+}
+
+// publishSequential processes events sequentially (original behavior)
+func (o *zerobushttpOutput) publishSequential(ctx context.Context, batch publisher.Batch, events []publisher.Event, st outputs.Observer) error {
 	acked := 0
 	failed := 0
 
 	for i := range events {
 		success := o.publishEvent(ctx, &events[i])
 		if success {
+			acked++
+		} else {
+			failed++
+		}
+	}
+
+	batch.ACK()
+	st.AckedEvents(acked)
+	if failed > 0 {
+		st.PermanentErrors(failed)
+	}
+
+	return nil
+}
+
+// publishParallel processes events in parallel using a worker pool
+func (o *zerobushttpOutput) publishParallel(ctx context.Context, batch publisher.Batch, events []publisher.Event, st outputs.Observer) error {
+	type encodedEvent struct {
+		index int
+		data  []byte
+		err   error
+	}
+
+	type result struct {
+		index   int
+		success bool
+	}
+
+	// Encode all events first (encoding is not thread-safe)
+	// The expensive part is HTTP I/O, not encoding, so this is fine
+	encodedEvents := make([]encodedEvent, len(events))
+	for i := range events {
+		serialized, err := o.codec.Encode(o.index, &events[i].Content)
+		encodedEvents[i] = encodedEvent{
+			index: i,
+			data:  serialized,
+			err:   err,
+		}
+		if err != nil {
+			o.log.Errorf("Failed to encode event %d: %v", i, err)
+			o.observer.WriteError(err)
+		}
+	}
+
+	// Create result channel and semaphore for worker pool
+	results := make(chan result, len(events))
+	sem := make(chan struct{}, o.config.Workers)
+
+	// Use WaitGroup to ensure all goroutines complete
+	var wg sync.WaitGroup
+
+	// Launch workers for each encoded event
+	for _, encoded := range encodedEvents {
+		if encoded.err != nil {
+			// Skip events that failed to encode
+			results <- result{index: encoded.index, success: false}
+			continue
+		}
+
+		wg.Add(1)
+		// Acquire semaphore slot
+		sem <- struct{}{}
+
+		go func(idx int, data []byte) {
+			defer func() {
+				<-sem // Release semaphore
+				wg.Done()
+			}()
+
+			success := o.publishEncodedEvent(ctx, data)
+			results <- result{index: idx, success: success}
+		}(encoded.index, encoded.data)
+	}
+
+	// Wait for all workers to complete
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect results
+	acked := 0
+	failed := 0
+	for r := range results {
+		if r.success {
 			acked++
 		} else {
 			failed++
@@ -161,6 +259,42 @@ func (o *zerobushttpOutput) Publish(ctx context.Context, batch publisher.Batch) 
 	}
 
 	return nil
+}
+
+// publishEncodedEvent publishes an already-encoded event to ZeroBus
+func (o *zerobushttpOutput) publishEncodedEvent(ctx context.Context, serializedEvent []byte) bool {
+	// Create HTTP request
+	req, err := http.NewRequestWithContext(ctx, "POST", o.baseURL, strings.NewReader(string(serializedEvent)))
+	if err != nil {
+		o.log.Errorf("Failed to create HTTP request: %v", err)
+		o.observer.WriteError(err)
+		return false
+	}
+
+	// Set required headers
+	o.setRequiredHeaders(req)
+
+	// Set optional headers
+	o.setOptionalHeaders(req)
+
+	// Send request
+	resp, err := o.client.Do(req)
+	if err != nil {
+		o.log.Errorf("Failed to send HTTP request: %v", err)
+		o.observer.WriteError(err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	// Check response
+	if resp.StatusCode != http.StatusOK {
+		o.log.Errorf("HTTP request failed with status %d", resp.StatusCode)
+		o.observer.WriteError(fmt.Errorf("HTTP request failed with status %d", resp.StatusCode))
+		return false
+	}
+
+	o.observer.WriteBytes(len(serializedEvent))
+	return true
 }
 
 // publishEvent publishes a single event to ZeroBus
@@ -234,10 +368,28 @@ func (o *zerobushttpOutput) String() string {
 // createHTTPClient creates an HTTP client with the given configuration
 // Returns the HTTP client, a boolean indicating if OAuth is being used, and an error
 func createHTTPClient(config *Config, logger *logp.Logger) (*http.Client, bool, error) {
+	// Optimize transport for parallel workers
+	// MaxIdleConnsPerHost should be >= Workers to avoid connection creation overhead
+	maxConnsPerHost := config.Workers
+	if maxConnsPerHost < 10 {
+		maxConnsPerHost = 10 // Minimum for good performance
+	}
+	if maxConnsPerHost > 50 {
+		maxConnsPerHost = 50 // Maximum to avoid resource exhaustion
+	}
+
 	transport := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   maxConnsPerHost,
+		MaxConnsPerHost:       maxConnsPerHost,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: config.Timeout,
+		DisableCompression:    false,     // Enable compression
+		ForceAttemptHTTP2:     true,      // Enable HTTP/2
+		WriteBufferSize:       32 * 1024, // 32KB write buffer
+		ReadBufferSize:        32 * 1024, // 32KB read buffer
 	}
 
 	// Configure TLS if specified
@@ -247,6 +399,13 @@ func createHTTPClient(config *Config, logger *logp.Logger) (*http.Client, bool, 
 			return nil, false, fmt.Errorf("failed to load TLS config: %w", err)
 		}
 		transport.TLSClientConfig = tlsConfig.BuildModuleClientConfig("")
+	}
+
+	// Enable HTTP/2
+	if err := http2.ConfigureTransport(transport); err != nil {
+		logger.Warnf("Failed to configure HTTP/2 transport: %v (falling back to HTTP/1.1)", err)
+	} else {
+		logger.Debug("HTTP/2 support enabled")
 	}
 
 	baseClient := &http.Client{

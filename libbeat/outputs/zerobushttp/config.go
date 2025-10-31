@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +43,7 @@ type Config struct {
 	TLS          *tlscommon.Config `config:"ssl"`
 	Codec        codec.Config      `config:"codec"`
 	BatchSize    int               `config:"batch_size"`
+	Workers      int               `config:"workers"` // Number of concurrent workers for parallel publishing
 	Headers      map[string]string `config:"headers"`
 	Queue        config.Namespace  `config:"queue"`
 }
@@ -71,6 +73,7 @@ func defaultConfig() Config {
 		},
 		TLS:       nil,
 		BatchSize: 1, // Default to one event per request as per ZeroBus API
+		Workers:   4, // Default to 4 concurrent workers for parallel publishing
 		Headers:   make(map[string]string),
 	}
 }
@@ -106,9 +109,15 @@ func (c *Config) Validate() error {
 		return errors.New("only one authentication method can be configured: use either pat_token or oauth, not both")
 	}
 
-	// Validate workspace_id is required when using OAuth
-	if hasOAuth && c.WorkspaceID == "" {
-		return errors.New("workspace_id is required when using OAuth authentication")
+	// Validate that workspace_id can be determined when OAuth is enabled
+	if hasOAuth {
+		workspaceID, err := c.getWorkspaceID()
+		if err != nil {
+			return fmt.Errorf("failed to determine workspace_id for OAuth: %w", err)
+		}
+		if workspaceID == "" {
+			return errors.New("workspace_id is required when using OAuth authentication (either explicitly or via zerobus_uri)")
+		}
 	}
 
 	if c.WorkspaceURL == "" {
@@ -142,6 +151,15 @@ func (c *Config) Validate() error {
 		return errors.New("batch_size must be positive")
 	}
 
+	// Validate workers
+	if c.Workers <= 0 {
+		return errors.New("workers must be positive")
+	}
+
+	if c.Workers > 100 {
+		return errors.New("workers must not exceed 100")
+	}
+
 	return nil
 }
 
@@ -157,9 +175,53 @@ func (c *Config) GetOAuthTokenURL() string {
 	return workspaceURL + "/oidc/v1/token"
 }
 
+// getWorkspaceID returns the workspace ID, either from explicit configuration
+// or extracted from the zerobus_uri hostname
+func (c *Config) getWorkspaceID() (string, error) {
+	var workspaceID string
+
+	// If explicitly configured, use it
+	if c.WorkspaceID != "" {
+		workspaceID = c.WorkspaceID
+	} else {
+		// Extract from zerobus_uri hostname
+		// Expected format: <workspace_id>.zerobus.<cloud-details>
+		// Example: 1234567890.zerobus.us-east-1.aws.databricks.com
+		hostname := c.ZeroBusURI
+		// Remove any protocol prefix if present
+		hostname = strings.TrimPrefix(hostname, "https://")
+		hostname = strings.TrimPrefix(hostname, "http://")
+
+		// Split by dots and check format
+		parts := strings.Split(hostname, ".")
+		if len(parts) < 2 {
+			return "", fmt.Errorf("invalid zerobus_uri format: expected <workspace_id>.zerobus.<cloud-details>, got %s", c.ZeroBusURI)
+		}
+
+		// Check if second part is "zerobus"
+		if parts[1] != "zerobus" {
+			return "", fmt.Errorf("invalid zerobus_uri format: expected <workspace_id>.zerobus.<cloud-details>, got %s", c.ZeroBusURI)
+		}
+
+		// First part is the workspace ID
+		workspaceID = parts[0]
+		if workspaceID == "" {
+			return "", fmt.Errorf("empty workspace_id extracted from zerobus_uri: %s", c.ZeroBusURI)
+		}
+	}
+
+	// Validate that workspace_id is a valid number (int64)
+	if _, err := strconv.ParseInt(workspaceID, 10, 64); err != nil {
+		return "", fmt.Errorf("workspace_id must be a valid number, got '%s': %w", workspaceID, err)
+	}
+
+	return workspaceID, nil
+}
+
 // GetOAuthResource returns the OAuth resource string for Databricks
 func (c *Config) GetOAuthResource() string {
-	return fmt.Sprintf("api://databricks/workspaces/%s/zerobusDirectWriteApi", c.WorkspaceID)
+	workspaceID, _ := c.getWorkspaceID() // Safe to ignore error as it's validated during config validation
+	return fmt.Sprintf("api://databricks/workspaces/%s/zerobusDirectWriteApi", workspaceID)
 }
 
 // buildURL constructs the ZeroBus ingest URL

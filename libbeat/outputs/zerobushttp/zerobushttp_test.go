@@ -20,9 +20,11 @@ package zerobushttp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -127,7 +129,7 @@ func TestConfigValidation(t *testing.T) {
 			expectError: false,
 		},
 		{
-			name: "valid OAuth config",
+			name: "valid OAuth config with explicit workspace_id",
 			config: map[string]interface{}{
 				"zerobus_uri":   "test-workspace.ingest.cloud.databricks.com",
 				"table_name":    "unity.default.air_quality",
@@ -141,7 +143,20 @@ func TestConfigValidation(t *testing.T) {
 			expectError: false,
 		},
 		{
-			name: "OAuth missing workspace_id",
+			name: "valid OAuth config with workspace_id extracted from zerobus_uri",
+			config: map[string]interface{}{
+				"zerobus_uri":   "1234567890123456.zerobus.us-east-1.aws.databricks.com",
+				"table_name":    "unity.default.air_quality",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+				"oauth": map[string]interface{}{
+					"client_id":     "test-client-id",
+					"client_secret": "test-client-secret",
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "OAuth with invalid zerobus_uri format (missing .zerobus)",
 			config: map[string]interface{}{
 				"zerobus_uri":   "test-workspace.ingest.cloud.databricks.com",
 				"table_name":    "unity.default.air_quality",
@@ -152,7 +167,7 @@ func TestConfigValidation(t *testing.T) {
 				},
 			},
 			expectError: true,
-			errorMsg:    "workspace_id is required when using OAuth authentication",
+			errorMsg:    "invalid zerobus_uri format",
 		},
 		{
 			name: "OAuth missing client_id",
@@ -185,11 +200,10 @@ func TestConfigValidation(t *testing.T) {
 		{
 			name: "both PAT and OAuth configured",
 			config: map[string]interface{}{
-				"zerobus_uri":   "test-workspace.ingest.cloud.databricks.com",
+				"zerobus_uri":   "1234567890123456.zerobus.us-east-1.aws.databricks.com",
 				"table_name":    "unity.default.air_quality",
 				"pat_token":     "test-token",
 				"workspace_url": "https://test-workspace.cloud.databricks.com",
-				"workspace_id":  "1234567890123456",
 				"oauth": map[string]interface{}{
 					"client_id":     "test-client-id",
 					"client_secret": "test-client-secret",
@@ -350,6 +364,143 @@ func TestTableNameParsing(t *testing.T) {
 			for i, expected := range tt.expectedParts {
 				if parts[i] != expected {
 					t.Fatalf("Expected part[%d] to be '%s', got '%s' for table name '%s'", i, expected, parts[i], tt.tableName)
+				}
+			}
+		})
+	}
+}
+
+func TestWorkspaceIDExtraction(t *testing.T) {
+	tests := []struct {
+		name             string
+		config           map[string]interface{}
+		expectedID       string
+		expectError      bool
+		errorMsg         string
+	}{
+		{
+			name: "explicit workspace_id",
+			config: map[string]interface{}{
+				"zerobus_uri":   "test-workspace.ingest.cloud.databricks.com",
+				"table_name":    "catalog.schema.table",
+				"pat_token":     "test-token",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+				"workspace_id":  "1122334455667788",
+			},
+			expectedID:  "1122334455667788",
+			expectError: false,
+		},
+		{
+			name: "extract from zerobus_uri (standard format)",
+			config: map[string]interface{}{
+				"zerobus_uri":   "1234567890123456.zerobus.us-east-1.aws.databricks.com",
+				"table_name":    "catalog.schema.table",
+				"pat_token":     "test-token",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+			},
+			expectedID:  "1234567890123456",
+			expectError: false,
+		},
+		{
+			name: "extract from zerobus_uri (with https prefix)",
+			config: map[string]interface{}{
+				"zerobus_uri":   "https://9876543210.zerobus.eu-west-1.aws.databricks.com",
+				"table_name":    "catalog.schema.table",
+				"pat_token":     "test-token",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+			},
+			expectedID:  "9876543210",
+			expectError: false,
+		},
+		{
+			name: "extract from zerobus_uri (Azure with numeric ID)",
+			config: map[string]interface{}{
+				"zerobus_uri":   "9988776655.zerobus.eastus2.azure.databricks.net",
+				"table_name":    "catalog.schema.table",
+				"pat_token":     "test-token",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+			},
+			expectedID:  "9988776655",
+			expectError: false,
+		},
+		{
+			name: "invalid - non-numeric workspace_id (explicit)",
+			config: map[string]interface{}{
+				"zerobus_uri":   "test-workspace.ingest.cloud.databricks.com",
+				"table_name":    "catalog.schema.table",
+				"pat_token":     "test-token",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+				"workspace_id":  "not-a-number",
+			},
+			expectedID:  "",
+			expectError: true,
+			errorMsg:    "workspace_id must be a valid number",
+		},
+		{
+			name: "invalid - non-numeric workspace_id (extracted)",
+			config: map[string]interface{}{
+				"zerobus_uri":   "workspace123.zerobus.eastus2.azure.databricks.net",
+				"table_name":    "catalog.schema.table",
+				"pat_token":     "test-token",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+			},
+			expectedID:  "",
+			expectError: true,
+			errorMsg:    "workspace_id must be a valid number",
+		},
+		{
+			name: "invalid format - missing .zerobus",
+			config: map[string]interface{}{
+				"zerobus_uri":   "test-workspace.ingest.cloud.databricks.com",
+				"table_name":    "catalog.schema.table",
+				"pat_token":     "test-token",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+			},
+			expectedID:  "",
+			expectError: true,
+			errorMsg:    "invalid zerobus_uri format",
+		},
+		{
+			name: "invalid format - too short",
+			config: map[string]interface{}{
+				"zerobus_uri":   "workspace",
+				"table_name":    "catalog.schema.table",
+				"pat_token":     "test-token",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+			},
+			expectedID:  "",
+			expectError: true,
+			errorMsg:    "invalid zerobus_uri format",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := config.NewConfigFrom(tt.config)
+			if err != nil {
+				t.Fatalf("Failed to create config: %v", err)
+			}
+
+			config, err := readConfig(cfg)
+			if err != nil {
+				t.Fatalf("Failed to read config: %v", err)
+			}
+
+			workspaceID, err := config.getWorkspaceID()
+			
+			if tt.expectError {
+				if err == nil {
+					t.Fatalf("Expected error but got none")
+				}
+				if !strings.Contains(err.Error(), tt.errorMsg) {
+					t.Fatalf("Expected error message to contain '%s', got: %s", tt.errorMsg, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				if workspaceID != tt.expectedID {
+					t.Fatalf("Expected workspace_id '%s', got '%s'", tt.expectedID, workspaceID)
 				}
 			}
 		})
@@ -579,6 +730,206 @@ func TestRetryableErrors(t *testing.T) {
 			if retryable != tt.retryable {
 				t.Fatalf("Expected %v, got %v for status code %d", tt.retryable, retryable, tt.statusCode)
 			}
+		})
+	}
+}
+
+func TestWorkerConfiguration(t *testing.T) {
+	tests := []struct {
+		name        string
+		workers     int
+		expectError bool
+		errorMsg    string
+	}{
+		{"default workers (4)", 4, false, ""},
+		{"single worker", 1, false, ""},
+		{"multiple workers", 8, false, ""},
+		{"max workers", 100, false, ""},
+		{"zero workers", 0, true, "workers must be positive"},
+		{"negative workers", -1, true, "workers must be positive"},
+		{"too many workers", 101, true, "workers must not exceed 100"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configMap := map[string]interface{}{
+				"zerobus_uri":   "test-workspace.ingest.cloud.databricks.com",
+				"table_name":    "unity.default.air_quality",
+				"pat_token":     "test-token",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+				"workers":       tt.workers,
+			}
+
+			cfg, err := config.NewConfigFrom(configMap)
+			if err != nil {
+				t.Fatalf("Failed to create config: %v", err)
+			}
+
+			config, err := readConfig(cfg)
+			if err != nil {
+				if !tt.expectError {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				return
+			}
+
+			err = config.Validate()
+			if tt.expectError {
+				if err == nil {
+					t.Fatalf("Expected error but got none")
+				}
+				if !strings.Contains(err.Error(), tt.errorMsg) {
+					t.Fatalf("Expected error message to contain '%s', got: %s", tt.errorMsg, err.Error())
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+				if config.Workers != tt.workers {
+					t.Fatalf("Expected %d workers, got %d", tt.workers, config.Workers)
+				}
+			}
+		})
+	}
+}
+
+func TestParallelEventPublishing(t *testing.T) {
+	// Track concurrent requests
+	var mu sync.Mutex
+	concurrent := 0
+	maxConcurrent := 0
+	totalRequests := 0
+
+	// Create a mock HTTPS server that tracks concurrency
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		totalRequests++
+		concurrent++
+		if concurrent > maxConcurrent {
+			maxConcurrent = concurrent
+		}
+		mu.Unlock()
+
+		// Simulate some work (longer delay to ensure overlap)
+		time.Sleep(50 * time.Millisecond)
+
+		mu.Lock()
+		concurrent--
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Successfully ingested record."))
+	}))
+	defer server.Close()
+
+	tests := []struct {
+		name              string
+		workers           int
+		eventCount        int
+		expectedMinConcur int
+		expectedMaxConcur int
+	}{
+		{"sequential (1 worker)", 1, 10, 1, 1},
+		{"parallel (4 workers)", 4, 10, 2, 4},
+		{"parallel (8 workers)", 8, 16, 4, 8},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Reset counters
+			mu.Lock()
+			concurrent = 0
+			maxConcurrent = 0
+			totalRequests = 0
+			mu.Unlock()
+
+			// Create configuration
+			configMap := map[string]interface{}{
+				"zerobus_uri":   strings.TrimPrefix(server.URL, "https://"),
+				"table_name":    "unity.default.air_quality",
+				"pat_token":     "test-token",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+				"timeout":       "30s",
+				"workers":       tt.workers,
+				"ssl": map[string]interface{}{
+					"verification_mode": "none", // Skip cert verification for test server
+				},
+			}
+
+			cfg, err := config.NewConfigFrom(configMap)
+			if err != nil {
+				t.Fatalf("Failed to create config: %v", err)
+			}
+
+			// Create beat info
+			beatInfo := beat.Info{
+				Beat:    "test-beat",
+				Version: "7.0.0",
+				Logger:  logp.NewLogger("test"),
+			}
+
+			// Create observer
+			observer := outputs.NewNilObserver()
+
+			// Create output
+			group, err := makeZeroBusHttp(nil, beatInfo, observer, cfg)
+			if err != nil {
+				t.Fatalf("Failed to create output: %v", err)
+			}
+
+			client := group.Clients[0]
+
+			// Create test events
+			events := make([]publisher.Event, tt.eventCount)
+			for i := range events {
+				events[i] = publisher.Event{
+					Content: beat.Event{
+						Timestamp: time.Now(),
+						Fields: mapstr.M{
+							"message": fmt.Sprintf("test message %d", i),
+						},
+					},
+				}
+			}
+
+			// Create batch
+			batch := &mockBatch{
+				events: events,
+			}
+
+			// Publish events
+			ctx := context.Background()
+			err = client.Publish(ctx, batch)
+			if err != nil {
+				t.Fatalf("Failed to publish events: %v", err)
+			}
+
+			// Verify batch was ACKed
+			if !batch.acked {
+				t.Fatalf("Expected batch to be ACKed")
+			}
+
+			// Check concurrency levels
+			mu.Lock()
+			finalMaxConcurrent := maxConcurrent
+			finalTotalRequests := totalRequests
+			mu.Unlock()
+
+			t.Logf("Total requests: %d, Max concurrent: %d", finalTotalRequests, finalMaxConcurrent)
+
+			if finalTotalRequests != tt.eventCount {
+				t.Fatalf("Expected %d total requests, got %d", tt.eventCount, finalTotalRequests)
+			}
+
+			if finalMaxConcurrent < tt.expectedMinConcur {
+				t.Fatalf("Expected at least %d concurrent requests, got %d", tt.expectedMinConcur, finalMaxConcurrent)
+			}
+
+			if finalMaxConcurrent > tt.expectedMaxConcur {
+				t.Fatalf("Expected at most %d concurrent requests, got %d", tt.expectedMaxConcur, finalMaxConcurrent)
+			}
+
+			t.Logf("Max concurrent requests: %d (expected %d-%d)", finalMaxConcurrent, tt.expectedMinConcur, tt.expectedMaxConcur)
 		})
 	}
 }
