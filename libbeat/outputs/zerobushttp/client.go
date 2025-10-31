@@ -30,22 +30,30 @@ import (
 
 // HTTPClient wraps the standard http.Client with ZeroBus-specific functionality
 type HTTPClient struct {
-	client *http.Client
-	log    *logp.Logger
-	config *Config
+	client     *http.Client
+	log        *logp.Logger
+	config     *Config
+	usingOAuth bool // true if OAuth is configured, false if using PAT
 }
 
 // NewHTTPClient creates a new HTTPClient instance
 func NewHTTPClient(config *Config, logger *logp.Logger) (*HTTPClient, error) {
-	client, err := createHTTPClient(config)
+	client, usingOAuth, err := createHTTPClient(config, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
 	}
 
+	if usingOAuth {
+		logger.Info("HTTPClient initialized with OAuth M2M authentication")
+	} else {
+		logger.Warn("HTTPClient initialized with PAT token (deprecated, please migrate to OAuth)")
+	}
+
 	return &HTTPClient{
-		client: client,
-		log:    logger,
-		config: config,
+		client:     client,
+		log:        logger,
+		config:     config,
+		usingOAuth: usingOAuth,
 	}, nil
 }
 
@@ -147,7 +155,11 @@ func (c *HTTPClient) handleResponse(resp *http.Response) error {
 // setRequiredHeaders sets the required ZeroBus headers
 func (c *HTTPClient) setRequiredHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+c.config.PATToken)
+	// Only set Authorization header manually when using PAT token
+	// When using OAuth, the oauth2 client sets it automatically
+	if !c.usingOAuth {
+		req.Header.Set("Authorization", "Bearer "+c.config.PATToken)
+	}
 	req.Header.Set("unity-catalog-endpoint", c.config.WorkspaceURL)
 	req.Header.Set("x-databricks-zerobus-table-name", c.config.TableName)
 }

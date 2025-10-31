@@ -33,8 +33,10 @@ import (
 type Config struct {
 	ZeroBusURI   string            `config:"zerobus_uri" validate:"required"`
 	TableName    string            `config:"table_name" validate:"required"`
-	PATToken     string            `config:"pat_token" validate:"required"`
+	PATToken     string            `config:"pat_token"`
+	OAuth        *OAuthConfig      `config:"oauth"`
 	WorkspaceURL string            `config:"workspace_url" validate:"required"`
+	WorkspaceID  string            `config:"workspace_id"`
 	Timeout      time.Duration     `config:"timeout"`
 	Retry        retryConfig       `config:"retry"`
 	TLS          *tlscommon.Config `config:"ssl"`
@@ -42,6 +44,12 @@ type Config struct {
 	BatchSize    int               `config:"batch_size"`
 	Headers      map[string]string `config:"headers"`
 	Queue        config.Namespace  `config:"queue"`
+}
+
+// OAuthConfig contains OAuth2 client credentials configuration
+type OAuthConfig struct {
+	ClientID     string `config:"client_id" validate:"required"`
+	ClientSecret string `config:"client_secret" validate:"required"`
 }
 
 type retryConfig struct {
@@ -86,8 +94,21 @@ func (c *Config) Validate() error {
 		return errors.New("table_name is required")
 	}
 
-	if c.PATToken == "" {
-		return errors.New("pat_token is required")
+	// Validate authentication: exactly one method must be configured
+	hasPAT := c.PATToken != ""
+	hasOAuth := c.OAuth != nil && c.OAuth.ClientID != "" && c.OAuth.ClientSecret != ""
+
+	if !hasPAT && !hasOAuth {
+		return errors.New("authentication is required: either pat_token or oauth (client_id and client_secret) must be configured")
+	}
+
+	if hasPAT && hasOAuth {
+		return errors.New("only one authentication method can be configured: use either pat_token or oauth, not both")
+	}
+
+	// Validate workspace_id is required when using OAuth
+	if hasOAuth && c.WorkspaceID == "" {
+		return errors.New("workspace_id is required when using OAuth authentication")
 	}
 
 	if c.WorkspaceURL == "" {
@@ -124,6 +145,23 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// IsOAuthEnabled returns true if OAuth authentication is configured
+func (c *Config) IsOAuthEnabled() bool {
+	return c.OAuth != nil && c.OAuth.ClientID != "" && c.OAuth.ClientSecret != ""
+}
+
+// GetOAuthTokenURL returns the OAuth token endpoint URL
+func (c *Config) GetOAuthTokenURL() string {
+	// Clean workspace URL and append the OIDC token endpoint
+	workspaceURL := strings.TrimSuffix(c.WorkspaceURL, "/")
+	return workspaceURL + "/oidc/v1/token"
+}
+
+// GetOAuthResource returns the OAuth resource string for Databricks
+func (c *Config) GetOAuthResource() string {
+	return fmt.Sprintf("api://databricks/workspaces/%s/zerobusDirectWriteApi", c.WorkspaceID)
+}
+
 // buildURL constructs the ZeroBus ingest URL
 func (c *Config) buildURL() string {
 	// Clean the URI by removing protocol if present
@@ -136,6 +174,56 @@ func (c *Config) buildURL() string {
 
 // isValidTableName validates that the table name follows catalog.schema.table format
 func isValidTableName(tableName string) bool {
-	parts := strings.Split(tableName, ".")
+	parts := parseTableName(tableName)
 	return len(parts) == 3 && parts[0] != "" && parts[1] != "" && parts[2] != ""
+}
+
+// parseTableName parses a table name into catalog, schema, and table parts
+// Handles backtick-quoted identifiers (e.g., `catalog`.schema.`table`)
+func parseTableName(tableName string) []string {
+	var parts []string
+	var current strings.Builder
+	inBackticks := false
+
+	for i := 0; i < len(tableName); i++ {
+		ch := tableName[i]
+
+		switch ch {
+		case '`':
+			inBackticks = !inBackticks
+		case '.':
+			if inBackticks {
+				current.WriteByte(ch)
+			} else {
+				parts = append(parts, current.String())
+				current.Reset()
+			}
+		default:
+			current.WriteByte(ch)
+		}
+	}
+
+	// Add the last part
+	if current.Len() > 0 {
+		parts = append(parts, current.String())
+	}
+
+	return parts
+}
+
+// GetAuthorizationDetails returns the authorization_details JSON for OAuth
+func (c *Config) GetAuthorizationDetails() string {
+	parts := parseTableName(c.TableName)
+	if len(parts) != 3 {
+		// Fallback to empty if parsing fails (shouldn't happen after validation)
+		return "[]"
+	}
+
+	catalog := parts[0]
+	schema := parts[1]
+	table := parts[2]
+
+	// Build compact JSON array
+	return fmt.Sprintf(`[{"type":"unity_catalog_privileges","privileges":["USE CATALOG"],"object_type":"CATALOG","object_full_path":"%s"},{"type":"unity_catalog_privileges","privileges":["USE SCHEMA"],"object_type":"SCHEMA","object_full_path":"%s.%s"},{"type":"unity_catalog_privileges","privileges":["SELECT","MODIFY"],"object_type":"TABLE","object_full_path":"%s.%s.%s"}]`,
+		catalog, catalog, schema, catalog, schema, table)
 }

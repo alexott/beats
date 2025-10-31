@@ -72,14 +72,14 @@ func TestConfigValidation(t *testing.T) {
 			errorMsg:    "table_name is required",
 		},
 		{
-			name: "missing pat_token",
+			name: "missing authentication",
 			config: map[string]interface{}{
 				"zerobus_uri":   "test-workspace.ingest.cloud.databricks.com",
 				"table_name":    "unity.default.air_quality",
 				"workspace_url": "https://test-workspace.cloud.databricks.com",
 			},
 			expectError: true,
-			errorMsg:    "pat_token is required",
+			errorMsg:    "authentication is required",
 		},
 		{
 			name: "missing workspace_url",
@@ -125,6 +125,78 @@ func TestConfigValidation(t *testing.T) {
 				},
 			},
 			expectError: false,
+		},
+		{
+			name: "valid OAuth config",
+			config: map[string]interface{}{
+				"zerobus_uri":   "test-workspace.ingest.cloud.databricks.com",
+				"table_name":    "unity.default.air_quality",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+				"workspace_id":  "1234567890123456",
+				"oauth": map[string]interface{}{
+					"client_id":     "test-client-id",
+					"client_secret": "test-client-secret",
+				},
+			},
+			expectError: false,
+		},
+		{
+			name: "OAuth missing workspace_id",
+			config: map[string]interface{}{
+				"zerobus_uri":   "test-workspace.ingest.cloud.databricks.com",
+				"table_name":    "unity.default.air_quality",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+				"oauth": map[string]interface{}{
+					"client_id":     "test-client-id",
+					"client_secret": "test-client-secret",
+				},
+			},
+			expectError: true,
+			errorMsg:    "workspace_id is required when using OAuth authentication",
+		},
+		{
+			name: "OAuth missing client_id",
+			config: map[string]interface{}{
+				"zerobus_uri":   "test-workspace.ingest.cloud.databricks.com",
+				"table_name":    "unity.default.air_quality",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+				"workspace_id":  "1234567890123456",
+				"oauth": map[string]interface{}{
+					"client_secret": "test-client-secret",
+				},
+			},
+			expectError: true,
+			errorMsg:    "authentication is required",
+		},
+		{
+			name: "OAuth missing client_secret",
+			config: map[string]interface{}{
+				"zerobus_uri":   "test-workspace.ingest.cloud.databricks.com",
+				"table_name":    "unity.default.air_quality",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+				"workspace_id":  "1234567890123456",
+				"oauth": map[string]interface{}{
+					"client_id": "test-client-id",
+				},
+			},
+			expectError: true,
+			errorMsg:    "authentication is required",
+		},
+		{
+			name: "both PAT and OAuth configured",
+			config: map[string]interface{}{
+				"zerobus_uri":   "test-workspace.ingest.cloud.databricks.com",
+				"table_name":    "unity.default.air_quality",
+				"pat_token":     "test-token",
+				"workspace_url": "https://test-workspace.cloud.databricks.com",
+				"workspace_id":  "1234567890123456",
+				"oauth": map[string]interface{}{
+					"client_id":     "test-client-id",
+					"client_secret": "test-client-secret",
+				},
+			},
+			expectError: true,
+			errorMsg:    "only one authentication method can be configured",
 		},
 	}
 
@@ -217,6 +289,9 @@ func TestTableNameValidation(t *testing.T) {
 		{"valid table name", "unity.default.air_quality", true},
 		{"valid with underscores", "catalog.schema.table_name", true},
 		{"valid with hyphens", "catalog.schema.table-name", true},
+		{"valid with backticks", "`catalog`.schema.`table`", true},
+		{"valid with all backticks", "`catalog`.`schema`.`table`", true},
+		{"valid with dots in backticks", "`cat.alog`.schema.`tab.le`", true},
 		{"invalid - missing parts", "unity.air_quality", false},
 		{"invalid - too many parts", "unity.default.air.quality", false},
 		{"invalid - empty parts", "unity..air_quality", false},
@@ -228,6 +303,90 @@ func TestTableNameValidation(t *testing.T) {
 			valid := isValidTableName(tt.tableName)
 			if valid != tt.valid {
 				t.Fatalf("Expected %v, got %v for table name '%s'", tt.valid, valid, tt.tableName)
+			}
+		})
+	}
+}
+
+func TestTableNameParsing(t *testing.T) {
+	tests := []struct {
+		name           string
+		tableName      string
+		expectedParts  []string
+	}{
+		{
+			name:          "simple table name",
+			tableName:     "catalog.schema.table",
+			expectedParts: []string{"catalog", "schema", "table"},
+		},
+		{
+			name:          "with backticks on catalog and table",
+			tableName:     "`catalog`.schema.`table`",
+			expectedParts: []string{"catalog", "schema", "table"},
+		},
+		{
+			name:          "all parts with backticks",
+			tableName:     "`catalog`.`schema`.`table`",
+			expectedParts: []string{"catalog", "schema", "table"},
+		},
+		{
+			name:          "dots inside backticks",
+			tableName:     "`cat.alog`.schema.`tab.le`",
+			expectedParts: []string{"cat.alog", "schema", "tab.le"},
+		},
+		{
+			name:          "special characters in backticks",
+			tableName:     "`cat-alog`.`sche-ma`.`tab-le`",
+			expectedParts: []string{"cat-alog", "sche-ma", "tab-le"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parts := parseTableName(tt.tableName)
+			if len(parts) != len(tt.expectedParts) {
+				t.Fatalf("Expected %d parts, got %d for table name '%s'", len(tt.expectedParts), len(parts), tt.tableName)
+			}
+			for i, expected := range tt.expectedParts {
+				if parts[i] != expected {
+					t.Fatalf("Expected part[%d] to be '%s', got '%s' for table name '%s'", i, expected, parts[i], tt.tableName)
+				}
+			}
+		})
+	}
+}
+
+func TestAuthorizationDetails(t *testing.T) {
+	tests := []struct {
+		name         string
+		tableName    string
+		expectedJSON string
+	}{
+		{
+			name:         "simple table name",
+			tableName:    "catalog.schema.table",
+			expectedJSON: `[{"type":"unity_catalog_privileges","privileges":["USE CATALOG"],"object_type":"CATALOG","object_full_path":"catalog"},{"type":"unity_catalog_privileges","privileges":["USE SCHEMA"],"object_type":"SCHEMA","object_full_path":"catalog.schema"},{"type":"unity_catalog_privileges","privileges":["SELECT","MODIFY"],"object_type":"TABLE","object_full_path":"catalog.schema.table"}]`,
+		},
+		{
+			name:         "with backticks",
+			tableName:    "`catalog`.schema.`table`",
+			expectedJSON: `[{"type":"unity_catalog_privileges","privileges":["USE CATALOG"],"object_type":"CATALOG","object_full_path":"catalog"},{"type":"unity_catalog_privileges","privileges":["USE SCHEMA"],"object_type":"SCHEMA","object_full_path":"catalog.schema"},{"type":"unity_catalog_privileges","privileges":["SELECT","MODIFY"],"object_type":"TABLE","object_full_path":"catalog.schema.table"}]`,
+		},
+		{
+			name:         "dots in backticks",
+			tableName:    "`cat.alog`.schema.`tab.le`",
+			expectedJSON: `[{"type":"unity_catalog_privileges","privileges":["USE CATALOG"],"object_type":"CATALOG","object_full_path":"cat.alog"},{"type":"unity_catalog_privileges","privileges":["USE SCHEMA"],"object_type":"SCHEMA","object_full_path":"cat.alog.schema"},{"type":"unity_catalog_privileges","privileges":["SELECT","MODIFY"],"object_type":"TABLE","object_full_path":"cat.alog.schema.tab.le"}]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &Config{
+				TableName: tt.tableName,
+			}
+			authDetails := config.GetAuthorizationDetails()
+			if authDetails != tt.expectedJSON {
+				t.Fatalf("Expected authorization_details:\n%s\nGot:\n%s", tt.expectedJSON, authDetails)
 			}
 		})
 	}

@@ -21,8 +21,12 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
+
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/outputs"
@@ -36,13 +40,14 @@ import (
 
 // zerobushttpOutput implements the outputs.Client interface for ZeroBus HTTP output
 type zerobushttpOutput struct {
-	log      *logp.Logger
-	client   *http.Client
-	config   *Config
-	codec    codec.Codec
-	observer outputs.Observer
-	index    string
-	baseURL  string
+	log        *logp.Logger
+	client     *http.Client
+	config     *Config
+	codec      codec.Codec
+	observer   outputs.Observer
+	index      string
+	baseURL    string
+	usingOAuth bool // true if OAuth is configured, false if using PAT
 }
 
 func init() {
@@ -81,13 +86,13 @@ func makeZeroBusHttp(
 	}
 
 	// Create HTTP client
-	client, err := createHTTPClient(config)
+	client, usingOAuth, err := createHTTPClient(config, beat.Logger)
 	if err != nil {
 		return outputs.Fail(fmt.Errorf("failed to create HTTP client: %w", err))
 	}
 
 	// Create output instance
-	output, err := newZeroBusHttp(beat, observer, config, enc, client)
+	output, err := newZeroBusHttp(beat, observer, config, enc, client, usingOAuth)
 	if err != nil {
 		return outputs.Fail(fmt.Errorf("zerobushttp output initialization failed: %w", err))
 	}
@@ -102,18 +107,24 @@ func newZeroBusHttp(
 	config *Config,
 	codec codec.Codec,
 	client *http.Client,
+	usingOAuth bool,
 ) (*zerobushttpOutput, error) {
 	output := &zerobushttpOutput{
-		log:      beat.Logger.Named("zerobushttp"),
-		client:   client,
-		config:   config,
-		codec:    codec,
-		observer: observer,
-		index:    beat.Beat,
-		baseURL:  config.buildURL(),
+		log:        beat.Logger.Named("zerobushttp"),
+		client:     client,
+		config:     config,
+		codec:      codec,
+		observer:   observer,
+		index:      beat.Beat,
+		baseURL:    config.buildURL(),
+		usingOAuth: usingOAuth,
 	}
 
-	output.log.Infof("Initialized ZeroBus HTTP output for table: %s", config.TableName)
+	if usingOAuth {
+		output.log.Infof("Initialized ZeroBus HTTP output for table: %s (using OAuth M2M authentication)", config.TableName)
+	} else {
+		output.log.Warnf("Initialized ZeroBus HTTP output for table: %s (using PAT token - deprecated, please migrate to OAuth)", config.TableName)
+	}
 	return output, nil
 }
 
@@ -199,7 +210,11 @@ func (o *zerobushttpOutput) publishEvent(ctx context.Context, event *publisher.E
 // setRequiredHeaders sets the required ZeroBus headers
 func (o *zerobushttpOutput) setRequiredHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+o.config.PATToken)
+	// Only set Authorization header manually when using PAT token
+	// When using OAuth, the oauth2 client sets it automatically
+	if !o.usingOAuth {
+		req.Header.Set("Authorization", "Bearer "+o.config.PATToken)
+	}
 	req.Header.Set("unity-catalog-endpoint", o.config.WorkspaceURL)
 	req.Header.Set("x-databricks-zerobus-table-name", o.config.TableName)
 }
@@ -217,7 +232,8 @@ func (o *zerobushttpOutput) String() string {
 }
 
 // createHTTPClient creates an HTTP client with the given configuration
-func createHTTPClient(config *Config) (*http.Client, error) {
+// Returns the HTTP client, a boolean indicating if OAuth is being used, and an error
+func createHTTPClient(config *Config, logger *logp.Logger) (*http.Client, bool, error) {
 	transport := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 10,
@@ -226,15 +242,47 @@ func createHTTPClient(config *Config) (*http.Client, error) {
 
 	// Configure TLS if specified
 	if config.TLS != nil {
-		tlsConfig, err := tlscommon.LoadTLSConfig(config.TLS, logp.NewLogger("zerobushttp"))
+		tlsConfig, err := tlscommon.LoadTLSConfig(config.TLS, logger)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load TLS config: %w", err)
+			return nil, false, fmt.Errorf("failed to load TLS config: %w", err)
 		}
 		transport.TLSClientConfig = tlsConfig.BuildModuleClientConfig("")
 	}
 
-	return &http.Client{
+	baseClient := &http.Client{
 		Transport: transport,
 		Timeout:   config.Timeout,
-	}, nil
+	}
+
+	// If OAuth is configured, wrap the client with OAuth2 client credentials
+	if config.IsOAuthEnabled() {
+		logger.Info("Configuring OAuth M2M authentication for ZeroBus")
+
+		// Create OAuth2 client credentials config
+		oauthConfig := clientcredentials.Config{
+			ClientID:     config.OAuth.ClientID,
+			ClientSecret: config.OAuth.ClientSecret,
+			TokenURL:     config.GetOAuthTokenURL(),
+			Scopes:       []string{"all-apis"},
+			AuthStyle:    oauth2.AuthStyleInHeader,
+			EndpointParams: url.Values{
+				"resource":              []string{config.GetOAuthResource()},
+				"authorization_details": []string{config.GetAuthorizationDetails()},
+			},
+		}
+
+		// Create context with the base HTTP client for token requests
+		ctx := context.WithValue(context.Background(), oauth2.HTTPClient, baseClient)
+
+		// Get OAuth-wrapped client that handles token management automatically
+		oauthClient := oauthConfig.Client(ctx)
+
+		// Preserve timeout from base client
+		oauthClient.Timeout = config.Timeout
+
+		return oauthClient, true, nil
+	}
+
+	// Using PAT token
+	return baseClient, false, nil
 }
