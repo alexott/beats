@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(superpowers:brainstorming)",
+      "Bash(mkdir:*)",
+      "SlashCommand(/superpowers:write-plan)",
+      "Skill(superpowers:writing-plans)",
+      "Skill(superpowers:executing-plans)",
+      "Bash(go build:*)",
+      "Bash(go mod tidy:*)",
+      "Bash(go mod edit:*)",
+      "Bash(git checkout:*)",
+      "Bash(go get:*)",
+      "Bash(GOPRIVATE=github.com/databricks/zerobus-sdk-go go get:*)",
+      "Bash(CGO_ENABLED=1 go build:*)",
+      "Bash(env CGO_ENABLED=1 go build:*)",
+      "Bash(go list:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(go test:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
