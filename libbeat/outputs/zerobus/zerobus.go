@@ -262,14 +262,22 @@ func (o *zerobusOutput) Publish(ctx context.Context, batch publisher.Batch) erro
 		o.workerSem <- struct{}{}
 		wg.Add(1)
 
-		go func(idx int, jsonBytes []byte) {
+		go func(idx int, data []byte) {
 			defer func() {
 				<-o.workerSem // Release worker
 				wg.Done()
 			}()
 
 			// IngestRecord blocks until queued (SDK handles backpressure)
-			ack, err := o.stream.IngestRecord(string(jsonBytes))
+			// SDK routes based on type: []byte → proto, string → JSON
+			var payload interface{}
+			if o.config.RecordType == "proto" {
+				payload = data // Pass as []byte for proto ingestion
+			} else {
+				payload = string(data) // Pass as string for JSON ingestion
+			}
+
+			ack, err := o.stream.IngestRecord(payload)
 			if err != nil {
 				o.log.Errorf("Failed to ingest event %d: %v", idx, err)
 				o.observer.WriteError(err)
