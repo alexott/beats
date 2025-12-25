@@ -63,7 +63,7 @@ func TestIntegrationZerobusOutput(t *testing.T) {
 		},
 		Workers:    2,
 		Timeout:    30 * time.Second,
-		BatchSize:  10,
+		BatchSize:  1, // API limitation: must be 1 for JSON mode
 		RecordType: "json",
 		SDKOptions: SDKOptions{
 			MaxInflightRequests:      10000,

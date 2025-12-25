@@ -32,6 +32,8 @@ The output creates a long-lived gRPC stream to the Zerobus service and uses a wo
 
 See `docs/zerobus.asciidoc` for complete configuration reference.
 
+**Important:** The Zerobus API currently requires `batch_size: 1` for JSON mode. This is an API limitation. To achieve high throughput, increase the `workers` setting instead (e.g., `workers: 16`).
+
 ## Implementation Status
 
 - [x] Phase 1: JSON ingestion

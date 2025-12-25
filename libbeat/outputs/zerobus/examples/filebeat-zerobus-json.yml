@@ -37,7 +37,7 @@ output.zerobus:
 
   # Performance tuning
   workers: 4        # Number of concurrent workers
-  batch_size: 2048  # Events per batch
+  batch_size: 1     # IMPORTANT: Must be 1 for JSON mode (API limitation)
 
   # Optional: SDK options for advanced tuning
   # sdk_options:

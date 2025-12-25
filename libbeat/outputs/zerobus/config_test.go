@@ -128,7 +128,7 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, "json", c.RecordType)
 	assert.Equal(t, 4, c.Workers)
 	assert.Equal(t, 30*time.Second, c.Timeout)
-	assert.Equal(t, 2048, c.BatchSize)
+	assert.Equal(t, 1, c.BatchSize) // API limitation: must be 1 for JSON mode
 	assert.Equal(t, uint64(1000000), c.SDKOptions.MaxInflightRequests)
 	assert.True(t, c.SDKOptions.Recovery)
 }

@@ -25,8 +25,8 @@ output.zerobus:
     client_secret: "${OAUTH_CLIENT_SECRET}"
 
   # High-throughput settings
-  workers: 16
-  batch_size: 8192
+  workers: 16       # Increase worker count for parallelism
+  batch_size: 1     # IMPORTANT: Must be 1 for JSON mode (API limitation)
 
   # Optimize SDK for high throughput
   sdk_options:

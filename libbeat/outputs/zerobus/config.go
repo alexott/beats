@@ -87,7 +87,8 @@ func defaultConfig() Config {
 			Max:     3,
 			Backoff: 1 * time.Second,
 		},
-		BatchSize: 2048,
+		// Note: Zerobus API currently requires batch_size=1 for JSON mode
+		BatchSize: 1,
 		SDKOptions: SDKOptions{
 			MaxInflightRequests:      1000000,
 			Recovery:                 true,

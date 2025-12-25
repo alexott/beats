@@ -24,7 +24,7 @@ output.zerobus:
     client_secret: "${OAUTH_CLIENT_SECRET}"
 
   workers: 4
-  batch_size: 2048
+  batch_size: 1
 ----
 
 ==== Configuration options
@@ -60,7 +60,9 @@ Number of concurrent worker goroutines for parallel event ingestion. Default: 4.
 [float]
 ===== `batch_size`
 
-Number of events to batch together before sending. Default: 2048.
+Number of events to batch together before sending. Default: 1.
+
+*Important:* The Zerobus API currently requires `batch_size: 1` for JSON mode. This is an API limitation, not a limitation of the output implementation.
 
 [float]
 ===== `record_type`
