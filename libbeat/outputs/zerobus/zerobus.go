@@ -20,6 +20,7 @@ package zerobus
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	zerobus "github.com/databricks/zerobus-sdk-go"
 
@@ -171,8 +172,113 @@ func (o *zerobusOutput) Close() error {
 
 // Publish implements the outputs.Client interface
 func (o *zerobusOutput) Publish(ctx context.Context, batch publisher.Batch) error {
-	// TODO: Implement batch publishing
+	events := batch.Events()
+	o.observer.NewBatch(len(events))
+
+	if len(events) == 0 {
+		batch.ACK()
+		return nil
+	}
+
+	// Phase 1: Pre-encode all events (codec is not thread-safe)
+	type encodedEvent struct {
+		index int
+		data  []byte
+		err   error
+	}
+
+	encodedEvents := make([]encodedEvent, len(events))
+	for i := range events {
+		data, err := o.codec.Encode(o.index, &events[i].Content)
+		encodedEvents[i] = encodedEvent{
+			index: i,
+			data:  data,
+			err:   err,
+		}
+		if err != nil {
+			o.log.Errorf("Failed to encode event %d: %v", i, err)
+			o.observer.WriteError(err)
+		}
+	}
+
+	// Phase 2: Parallel ingestion with worker pool
+	type result struct {
+		index   int
+		success bool
+		err     error
+	}
+
+	results := make(chan result, len(events))
+	var wg sync.WaitGroup
+
+	for _, encoded := range encodedEvents {
+		if encoded.err != nil {
+			// Skip events that failed encoding
+			results <- result{index: encoded.index, success: false, err: encoded.err}
+			continue
+		}
+
+		// Acquire worker slot
+		o.workerSem <- struct{}{}
+		wg.Add(1)
+
+		go func(idx int, jsonBytes []byte) {
+			defer func() {
+				<-o.workerSem // Release worker
+				wg.Done()
+			}()
+
+			// IngestRecord blocks until queued (SDK handles backpressure)
+			ack, err := o.stream.IngestRecord(string(jsonBytes))
+			if err != nil {
+				o.log.Errorf("Failed to ingest event %d: %v", idx, err)
+				o.observer.WriteError(err)
+				results <- result{index: idx, success: false, err: err}
+				return
+			}
+
+			// Wait for server acknowledgment
+			offset, err := ack.Await()
+			if err != nil {
+				o.log.Errorf("Failed to await ack for event %d: %v", idx, err)
+				o.observer.WriteError(err)
+				results <- result{index: idx, success: false, err: err}
+				return
+			}
+
+			o.log.Debugf("Event %d acknowledged at offset %d", idx, offset)
+			results <- result{index: idx, success: true}
+		}(encoded.index, encoded.data)
+	}
+
+	// Wait for all workers to complete
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Phase 3: Collect results
+	acked := 0
+	failed := 0
+	for r := range results {
+		if r.success {
+			acked++
+			o.observer.WriteBytes(len(encodedEvents[r.index].data))
+		} else {
+			failed++
+		}
+	}
+
+	// ACK the batch (always ACK to Beats)
 	batch.ACK()
+
+	// Report metrics
+	o.observer.AckedEvents(acked)
+	if failed > 0 {
+		// Mark as permanent errors → triggers Beats retry → eventual DLQ
+		o.observer.PermanentErrors(failed)
+	}
+
 	return nil
 }
 
