@@ -47,6 +47,20 @@ func init() {
 	outputs.RegisterType("zerobus", makeZerobus)
 }
 
+// workItem represents a work item for the worker pool
+type workItem struct {
+	index int
+	data  []byte
+}
+
+// workResult represents the result of processing a work item
+type workResult struct {
+	index   int
+	success bool
+	err     error
+	bytes   int
+}
+
 // zerobusOutput implements the outputs.Client interface
 type zerobusOutput struct {
 	log      *logp.Logger
@@ -62,8 +76,11 @@ type zerobusOutput struct {
 	// Proto support
 	messageDescriptor protoreflect.MessageDescriptor
 
-	// Concurrency control
-	workerSem chan struct{}
+	// Worker pool (replaces workerSem)
+	workChan   chan workItem
+	resultChan chan workResult
+	workerWg   sync.WaitGroup
+	shutdown   chan struct{}
 }
 
 // makeZerobus creates a new Zerobus output
@@ -174,9 +191,9 @@ func newZerobusOutput(
 		return nil, fmt.Errorf("failed to create stream: %w", err)
 	}
 
-	// Create worker semaphore
-	workerSem := make(chan struct{}, config.Workers)
-
+	// Create channels sized to batch_size to prevent deadlocks
+	// workChan: Must hold entire batch to avoid blocking encoder
+	// resultChan: Must hold entire batch to avoid blocking workers
 	output := &zerobusOutput{
 		log:               log,
 		config:            config,
@@ -186,18 +203,87 @@ func newZerobusOutput(
 		sdk:               sdk,
 		stream:            stream,
 		messageDescriptor: messageDescriptor,
-		workerSem:         workerSem,
+		workChan:          make(chan workItem, config.BatchSize),
+		resultChan:        make(chan workResult, config.BatchSize),
+		shutdown:          make(chan struct{}),
 	}
 
-	log.Infof("Initialized Zerobus output for table: %s (%d workers, mode: %s)",
-		config.TableName, config.Workers, config.RecordType)
+	// Start persistent workers
+	for i := 0; i < config.Workers; i++ {
+		output.workerWg.Add(1)
+		go output.worker(i)
+	}
+
+	log.Infof("Initialized Zerobus output for table: %s (workers=%d, mode=%s, batch_size=%d, channel_buffer=%d)",
+		config.TableName, config.Workers, config.RecordType, config.BatchSize, config.BatchSize)
 
 	return output, nil
+}
+
+// worker processes work items from the work channel
+func (o *zerobusOutput) worker(id int) {
+	defer o.workerWg.Done()
+	o.log.Debugf("Worker %d started", id)
+
+	for {
+		select {
+		case work, ok := <-o.workChan:
+			if !ok {
+				o.log.Debugf("Worker %d: Channel closed, exiting", id)
+				return
+			}
+
+			// Process work item
+			var payload interface{}
+			if o.config.RecordType == "proto" {
+				payload = work.data
+			} else {
+				payload = string(work.data)
+			}
+
+			ack, err := o.stream.IngestRecord(payload)
+			if err != nil {
+				o.log.Errorf("Worker %d: Failed to ingest event %d: %v", id, work.index, err)
+				o.observer.WriteError(err)
+				o.resultChan <- workResult{index: work.index, success: false, err: err}
+				continue
+			}
+
+			offset, err := ack.Await()
+			if err != nil {
+				o.log.Errorf("Worker %d: Failed to await ack for event %d: %v", id, work.index, err)
+				o.observer.WriteError(err)
+				o.resultChan <- workResult{index: work.index, success: false, err: err}
+				continue
+			}
+
+			o.log.Debugf("Worker %d: Event %d acknowledged at offset %d", id, work.index, offset)
+			o.resultChan <- workResult{
+				index:   work.index,
+				success: true,
+				bytes:   len(work.data),
+			}
+
+		case <-o.shutdown:
+			o.log.Debugf("Worker %d: Shutdown signal received, exiting", id)
+			return
+		}
+	}
 }
 
 // Close implements the outputs.Client interface
 func (o *zerobusOutput) Close() error {
 	o.log.Info("Closing Zerobus output")
+
+	// Signal workers to stop accepting new work
+	close(o.shutdown)
+
+	// Close work channel (workers will exit after processing in-flight items)
+	close(o.workChan)
+
+	// Wait for all workers to finish
+	o.workerWg.Wait()
+	o.log.Debug("All workers stopped")
 
 	// Close stream (flushes and waits for pending acks)
 	if err := o.stream.Close(); err != nil {
@@ -220,100 +306,45 @@ func (o *zerobusOutput) Publish(ctx context.Context, batch publisher.Batch) erro
 		return nil
 	}
 
-	// Phase 1: Pre-encode all events (codec is not thread-safe)
-	type encodedEvent struct {
-		index int
-		data  []byte
-		err   error
-	}
+	// Pipelined: Encode and submit immediately
+	// Workers start processing while we're still encoding
+	// Channels are sized to batch_size, so no blocking/deadlocks
+	submittedToWorkers := 0
+	encodingFailures := 0
 
-	encodedEvents := make([]encodedEvent, len(events))
 	for i := range events {
+		// Encode event (serial, codec not thread-safe)
 		data, err := o.encodeEvent(&events[i])
-		encodedEvents[i] = encodedEvent{
-			index: i,
-			data:  data,
-			err:   err,
-		}
 		if err != nil {
 			o.log.Errorf("Failed to encode event %d: %v", i, err)
 			o.observer.WriteError(err)
-		}
-	}
-
-	// Phase 2: Parallel ingestion with worker pool
-	type result struct {
-		index   int
-		success bool
-		err     error
-	}
-
-	results := make(chan result, len(events))
-	var wg sync.WaitGroup
-
-	for _, encoded := range encodedEvents {
-		if encoded.err != nil {
-			// Skip events that failed encoding
-			results <- result{index: encoded.index, success: false, err: encoded.err}
+			encodingFailures++
 			continue
 		}
 
-		// Acquire worker slot
-		o.workerSem <- struct{}{}
-		wg.Add(1)
-
-		go func(idx int, data []byte) {
-			defer func() {
-				<-o.workerSem // Release worker
-				wg.Done()
-			}()
-
-			// IngestRecord blocks until queued (SDK handles backpressure)
-			// SDK routes based on type: []byte → proto, string → JSON
-			var payload interface{}
-			if o.config.RecordType == "proto" {
-				payload = data // Pass as []byte for proto ingestion
-			} else {
-				payload = string(data) // Pass as string for JSON ingestion
-			}
-
-			ack, err := o.stream.IngestRecord(payload)
-			if err != nil {
-				o.log.Errorf("Failed to ingest event %d: %v", idx, err)
-				o.observer.WriteError(err)
-				results <- result{index: idx, success: false, err: err}
-				return
-			}
-
-			// Wait for server acknowledgment
-			offset, err := ack.Await()
-			if err != nil {
-				o.log.Errorf("Failed to await ack for event %d: %v", idx, err)
-				o.observer.WriteError(err)
-				results <- result{index: idx, success: false, err: err}
-				return
-			}
-
-			o.log.Debugf("Event %d acknowledged at offset %d", idx, offset)
-			results <- result{index: idx, success: true}
-		}(encoded.index, encoded.data)
+		// Submit to worker pool immediately
+		// With workChan sized to batch_size, this never blocks
+		o.workChan <- workItem{
+			index: i,
+			data:  data,
+		}
+		submittedToWorkers++
 	}
 
-	// Wait for all workers to complete
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
+	o.log.Debugf("Encoded and submitted %d events (%d encoding failures)", submittedToWorkers, encodingFailures)
 
-	// Phase 3: Collect results
+	// Collect worker results
+	// With resultChan sized to batch_size, workers never block
 	acked := 0
-	failed := 0
-	for r := range results {
+	workerFailures := 0
+
+	for i := 0; i < submittedToWorkers; i++ {
+		r := <-o.resultChan
 		if r.success {
 			acked++
-			o.observer.WriteBytes(len(encodedEvents[r.index].data))
+			o.observer.WriteBytes(r.bytes)
 		} else {
-			failed++
+			workerFailures++
 		}
 	}
 
@@ -322,10 +353,14 @@ func (o *zerobusOutput) Publish(ctx context.Context, batch publisher.Batch) erro
 
 	// Report metrics
 	o.observer.AckedEvents(acked)
-	if failed > 0 {
+	totalFailures := encodingFailures + workerFailures
+	if totalFailures > 0 {
 		// Mark as permanent errors → triggers Beats retry → eventual DLQ
-		o.observer.PermanentErrors(failed)
+		o.observer.PermanentErrors(totalFailures)
 	}
+
+	o.log.Debugf("Batch complete: %d acked, %d encoding failures, %d worker failures",
+		acked, encodingFailures, workerFailures)
 
 	return nil
 }
