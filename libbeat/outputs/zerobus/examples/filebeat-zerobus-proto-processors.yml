@@ -1,0 +1,131 @@
+# Advanced Filebeat configuration for Zerobus output with Protocol Buffers
+#
+# This example demonstrates using processors to transform events to match
+# the proto schema structure. For complete documentation, see: ../docs/proto-workflow.md
+
+filebeat.inputs:
+  - type: filestream
+    id: structured-app-logs
+    enabled: true
+    paths:
+      - /var/log/app/*.log
+
+    processors:
+      # 1. Parse JSON logs
+      - decode_json_fields:
+          fields: ["message"]
+          target: ""
+          overwrite_keys: true
+
+      # 2. Format timestamp to match proto schema
+      - timestamp:
+          field: "@timestamp"
+          target_field: "timestamp"
+          layouts:
+            - '2006-01-02T15:04:05.000Z'
+
+      # 3. Rename fields to match proto schema
+      - rename:
+          fields:
+            - from: "log.level"
+              to: "level"
+            - from: "agent.hostname"
+              to: "host"
+          ignore_missing: true
+          fail_on_error: false
+
+      # 4. Ensure message field exists
+      - rename:
+          fields:
+            - from: "log.message"
+              to: "message"
+          ignore_missing: true
+          fail_on_error: false
+
+      # 5. Add labels map for metadata
+      - add_fields:
+          target: "labels"
+          fields:
+            environment: "production"
+            service: "my-app"
+            region: "us-west-2"
+
+      # 6. Drop fields not in proto schema
+      - drop_fields:
+          fields:
+            - "agent"
+            - "ecs"
+            - "input"
+            - "log"
+            - "@timestamp"
+            - "@metadata"
+          ignore_missing: true
+
+output.zerobus:
+  zerobus_uri: "12345.zerobus.region.cloud.databricks.com"
+  workspace_url: "https://workspace.cloud.databricks.com"
+  table_name: "catalog.schema.app_logs"
+
+  oauth:
+    client_id: "${OAUTH_CLIENT_ID}"
+    client_secret: "${OAUTH_CLIENT_SECRET}"
+
+  # Protocol Buffer configuration
+  record_type: "proto"
+  proto_descriptor_file: "/etc/filebeat/app_log.descriptor"
+  proto_message_type: "app.AppLog"
+
+  workers: 8
+  batch_size: 1  # API limitation for JSON mode
+
+  sdk_options:
+    max_inflight_requests: 100000
+    recovery: true
+    recovery_retries: 5
+    flush_timeout_ms: 300000
+
+logging.level: info
+logging.selectors: ["*"]
+
+# PROTO SCHEMA (app_log.proto):
+#
+# syntax = "proto3";
+# package app;
+#
+# message AppLog {
+#   string timestamp = 1;
+#   string level = 2;        // DEBUG, INFO, WARN, ERROR
+#   string message = 3;
+#   string host = 4;
+#   map<string, string> labels = 5;
+# }
+#
+# GENERATE DESCRIPTOR:
+#
+# protoc --descriptor_set_out=app_log.descriptor \
+#        --include_imports \
+#        app_log.proto
+#
+# TROUBLESHOOTING:
+#
+# If you see "unknown field" errors:
+# - Add more fields to drop_fields processor
+# - Or add fields to your proto schema
+# - Or use a catch-all map<string, string> field
+#
+# If you see "type mismatch" errors:
+# - Use convert processor to change types:
+#   - convert:
+#       fields:
+#         - {from: "count", type: "integer"}
+#         - {from: "duration", type: "float"}
+#
+# If you see "missing required field" errors:
+# - Use add_fields processor to add default values
+# - Or make fields optional in proto schema (proto3 fields are optional by default)
+#
+# DEBUGGING:
+#
+# To see processed events before proto conversion, temporarily use console output:
+# output.console:
+#   pretty: true
