@@ -24,11 +24,13 @@ import (
 	"sync"
 
 	zerobus "github.com/databricks/zerobus-sdk-go"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/outputs"
@@ -225,7 +227,7 @@ func (o *zerobusOutput) Publish(ctx context.Context, batch publisher.Batch) erro
 
 	encodedEvents := make([]encodedEvent, len(events))
 	for i := range events {
-		data, err := o.codec.Encode(o.index, &events[i].Content)
+		data, err := o.encodeEvent(&events[i])
 		encodedEvents[i] = encodedEvent{
 			index: i,
 			data:  data,
@@ -321,6 +323,46 @@ func (o *zerobusOutput) Publish(ctx context.Context, batch publisher.Batch) erro
 // String implements the outputs.Client interface
 func (o *zerobusOutput) String() string {
 	return fmt.Sprintf("zerobus(%s)", o.config.TableName)
+}
+
+// encodeEvent encodes an event to JSON or Proto format
+func (o *zerobusOutput) encodeEvent(event *publisher.Event) ([]byte, error) {
+	// First encode to JSON using codec
+	jsonBytes, err := o.codec.Encode(o.index, &event.Content)
+	if err != nil {
+		return nil, fmt.Errorf("JSON encoding failed: %w", err)
+	}
+
+	// If JSON mode, return JSON bytes directly
+	if o.config.RecordType != "proto" {
+		return jsonBytes, nil
+	}
+
+	// Proto mode: Convert JSON → Proto
+	msg := dynamicpb.NewMessage(o.messageDescriptor)
+
+	// Convert JSON → Proto with strict validation
+	unmarshaler := protojson.UnmarshalOptions{
+		AllowPartial:   false, // Require all required fields
+		DiscardUnknown: false, // Fail on unknown fields
+	}
+
+	if err := unmarshaler.Unmarshal(jsonBytes, msg); err != nil {
+		return nil, &ProtoConversionError{
+			Message:      fmt.Sprintf("JSON→Proto conversion failed: %v", err),
+			OriginalJSON: string(jsonBytes),
+			MessageType:  o.config.ProtoMessageType,
+			Err:          err,
+		}
+	}
+
+	// Marshal to proto wire format
+	protoBytes, err := proto.Marshal(msg)
+	if err != nil {
+		return nil, fmt.Errorf("proto marshaling failed: %w", err)
+	}
+
+	return protoBytes, nil
 }
 
 // loadProtoDescriptor loads and parses a proto descriptor file
