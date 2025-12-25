@@ -49,19 +49,24 @@ message LogEvent {
 
 **Field Name Transformation:**
 
-Beats uses field names starting with `@` (like `@timestamp` and `@metadata`), but protobuf field names cannot start with special characters. The Zerobus output **automatically transforms** these fields during proto conversion:
+Beats uses field names that are incompatible with protobuf naming rules. The Zerobus output **automatically transforms** these fields during proto conversion:
 
+**@ prefix transformation:**
 - `@timestamp` → `_timestamp`
 - `@metadata` → `_metadata`
 - Any field starting with `@` → starts with `_`
 
-This transformation is recursive and applies to all nested objects and arrays. In your proto schema, use the underscore prefix:
+**Reserved keyword transformation:**
+- `message` → `msg` (protobuf reserved keyword)
+
+These transformations are recursive and apply to all nested objects and arrays. In your proto schema, use the transformed names:
 
 ```proto
 message LogEvent {
   string _timestamp = 1;    // Matches @timestamp from Beats
   string _metadata = 2;     // Matches @metadata from Beats
-  string message = 3;       // Regular fields remain unchanged
+  string msg = 3;           // Matches "message" field from Beats (reserved keyword)
+  string level = 4;         // Regular fields remain unchanged
 }
 ```
 
@@ -255,21 +260,24 @@ processors:
 
 3. Use `map<string, string>` in proto for dynamic fields
 
-#### Error: "unknown field @timestamp" or "unknown field @metadata"
+#### Error: "unknown field @timestamp", "@metadata", or "message"
 
-**Cause:** Proto schema uses `@` prefix instead of `_` prefix
+**Cause:** Proto schema doesn't use transformed field names
 
 **Solution:**
-The Zerobus output automatically transforms `@` to `_` in field names. Ensure your proto schema uses the underscore prefix:
+The Zerobus output automatically transforms incompatible field names. Ensure your proto schema uses the transformed names:
 
 ```proto
 message LogEvent {
-  string _timestamp = 1;  // NOT @timestamp
-  string _metadata = 2;   // NOT @metadata
+  string _timestamp = 1;  // NOT @timestamp (@ → _ transformation)
+  string _metadata = 2;   // NOT @metadata (@ → _ transformation)
+  string msg = 3;         // NOT message (reserved keyword → msg)
 }
 ```
 
-**Note:** This transformation is automatic - you don't need processors. The output handles it during JSON→Proto conversion.
+**Note:** These transformations are automatic - you don't need processors. The output handles them during JSON→Proto conversion:
+- Fields starting with `@` → start with `_`
+- Field `message` → `msg`
 
 #### Error: "JSON→Proto conversion failed: missing required field"
 
@@ -442,9 +450,9 @@ syntax = "proto3";
 package app;
 
 message AppLog {
-  string timestamp = 1;
-  string level = 2;        // DEBUG, INFO, WARN, ERROR
-  string message = 3;
+  string _timestamp = 1;     // Matches @timestamp (auto-transformed)
+  string level = 2;          // DEBUG, INFO, WARN, ERROR
+  string msg = 3;            // Matches "message" field (auto-transformed)
   string service_name = 4;
   string trace_id = 5;
   string span_id = 6;
@@ -460,7 +468,7 @@ syntax = "proto3";
 package metrics;
 
 message MetricEvent {
-  string timestamp = 1;
+  string _timestamp = 1;     // Matches @timestamp (auto-transformed)
   string metric_name = 2;
   double value = 3;
   string unit = 4;
@@ -475,10 +483,10 @@ syntax = "proto3";
 package logs;
 
 message StructuredLog {
-  string timestamp = 1;
+  string _timestamp = 1;     // Matches @timestamp (auto-transformed)
   string severity = 2;
   string source = 3;
-  string message = 4;
+  string msg = 4;            // Matches "message" field (auto-transformed)
   map<string, string> fields = 5;
   repeated string tags = 6;
 }

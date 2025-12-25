@@ -22,7 +22,7 @@ import (
 	"testing"
 )
 
-// TestTransformJSONFieldNames tests the @ → _ transformation
+// TestTransformJSONFieldNames tests the @ → _ and message → msg transformations
 func TestTransformJSONFieldNames(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -32,12 +32,12 @@ func TestTransformJSONFieldNames(t *testing.T) {
 		{
 			name:     "simple @timestamp",
 			input:    `{"@timestamp":"2024-01-01T00:00:00Z","message":"test"}`,
-			expected: `{"_timestamp":"2024-01-01T00:00:00Z","message":"test"}`,
+			expected: `{"_timestamp":"2024-01-01T00:00:00Z","msg":"test"}`,
 		},
 		{
 			name:     "multiple @ fields",
 			input:    `{"@timestamp":"2024-01-01T00:00:00Z","@metadata":{"beat":"filebeat"},"message":"test"}`,
-			expected: `{"_timestamp":"2024-01-01T00:00:00Z","_metadata":{"beat":"filebeat"},"message":"test"}`,
+			expected: `{"_timestamp":"2024-01-01T00:00:00Z","_metadata":{"beat":"filebeat"},"msg":"test"}`,
 		},
 		{
 			name:     "nested @ fields",
@@ -50,9 +50,29 @@ func TestTransformJSONFieldNames(t *testing.T) {
 			expected: `{"items":[{"_id":"1","name":"test"},{"_id":"2","name":"test2"}]}`,
 		},
 		{
-			name:     "no @ fields",
-			input:    `{"timestamp":"2024-01-01T00:00:00Z","message":"test"}`,
-			expected: `{"timestamp":"2024-01-01T00:00:00Z","message":"test"}`,
+			name:     "message field transformation",
+			input:    `{"timestamp":"2024-01-01T00:00:00Z","message":"hello world"}`,
+			expected: `{"timestamp":"2024-01-01T00:00:00Z","msg":"hello world"}`,
+		},
+		{
+			name:     "nested message field",
+			input:    `{"level":"info","nested":{"message":"nested message","status":"ok"}}`,
+			expected: `{"level":"info","nested":{"msg":"nested message","status":"ok"}}`,
+		},
+		{
+			name:     "message in array",
+			input:    `{"logs":[{"message":"log1","severity":"info"},{"message":"log2","severity":"error"}]}`,
+			expected: `{"logs":[{"msg":"log1","severity":"info"},{"msg":"log2","severity":"error"}]}`,
+		},
+		{
+			name:     "combined @ and message transformations",
+			input:    `{"@timestamp":"2024-01-01T00:00:00Z","@metadata":{"beat":"filebeat"},"message":"test log"}`,
+			expected: `{"_timestamp":"2024-01-01T00:00:00Z","_metadata":{"beat":"filebeat"},"msg":"test log"}`,
+		},
+		{
+			name:     "no transformations needed",
+			input:    `{"timestamp":"2024-01-01T00:00:00Z","msg":"already correct"}`,
+			expected: `{"timestamp":"2024-01-01T00:00:00Z","msg":"already correct"}`,
 		},
 		{
 			name:     "empty object",
@@ -92,16 +112,17 @@ func TestTransformMap(t *testing.T) {
 		"@metadata": map[string]interface{}{
 			"beat": "filebeat",
 		},
-		"message": "test",
+		"message": "test message",
 		"nested": map[string]interface{}{
 			"@special": "value",
+			"message":  "nested message",
 			"normal":   "data",
 		},
 	}
 
 	result := transformMap(input)
 
-	// Check top-level transformations
+	// Check @ transformations
 	if _, exists := result["@timestamp"]; exists {
 		t.Error("@timestamp should be transformed")
 	}
@@ -115,6 +136,17 @@ func TestTransformMap(t *testing.T) {
 		t.Error("_metadata should exist")
 	}
 
+	// Check message transformation
+	if _, exists := result["message"]; exists {
+		t.Error("message should be transformed to msg")
+	}
+	if _, exists := result["msg"]; !exists {
+		t.Error("msg should exist")
+	}
+	if result["msg"] != "test message" {
+		t.Error("msg value should be preserved")
+	}
+
 	// Check nested transformations
 	nested, ok := result["nested"].(map[string]interface{})
 	if !ok {
@@ -125,6 +157,12 @@ func TestTransformMap(t *testing.T) {
 	}
 	if _, exists := nested["_special"]; !exists {
 		t.Error("nested _special should exist")
+	}
+	if _, exists := nested["message"]; exists {
+		t.Error("nested message should be transformed to msg")
+	}
+	if _, exists := nested["msg"]; !exists {
+		t.Error("nested msg should exist")
 	}
 	if nested["normal"] != "data" {
 		t.Error("normal field should remain unchanged")

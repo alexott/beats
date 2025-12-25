@@ -373,8 +373,9 @@ func (o *zerobusOutput) encodeEvent(event *publisher.Event) ([]byte, error) {
 	return protoBytes, nil
 }
 
-// transformJSONFieldNames transforms field names starting with @ to start with _
-// This is needed because protobuf field names cannot start with @ but Beats uses @timestamp, @metadata
+// transformJSONFieldNames transforms field names for protobuf compatibility
+// - Fields starting with @ are changed to start with _ (@timestamp → _timestamp)
+// - Field "message" is changed to "msg" (protobuf reserved keyword)
 func transformJSONFieldNames(jsonBytes []byte) ([]byte, error) {
 	var data map[string]interface{}
 	if err := json.Unmarshal(jsonBytes, &data); err != nil {
@@ -391,15 +392,21 @@ func transformJSONFieldNames(jsonBytes []byte) ([]byte, error) {
 	return result, nil
 }
 
-// transformMap recursively transforms map keys starting with @ to start with _
+// transformMap recursively transforms map keys for protobuf compatibility
+// - @ prefix → _ prefix
+// - "message" → "msg" (protobuf reserved keyword)
 func transformMap(m map[string]interface{}) map[string]interface{} {
 	result := make(map[string]interface{}, len(m))
 
 	for key, value := range m {
-		// Transform the key: @ → _
+		// Transform the key
 		newKey := key
 		if strings.HasPrefix(key, "@") {
+			// @ → _
 			newKey = "_" + strings.TrimPrefix(key, "@")
+		} else if key == "message" {
+			// message → msg (protobuf reserved keyword)
+			newKey = "msg"
 		}
 
 		// Recursively transform nested maps and slices
