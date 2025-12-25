@@ -1,0 +1,52 @@
+# Example Filebeat configuration for Zerobus output (JSON mode)
+
+###################### Filebeat Configuration ######################
+
+filebeat.inputs:
+  - type: filestream
+    id: zerobus-example
+    enabled: true
+    paths:
+      - /var/log/*.log
+
+    # Optional: Add processors to shape data
+    processors:
+      - add_host_metadata:
+          when.not.contains.tags: forwarded
+      - add_fields:
+          target: ''
+          fields:
+            environment: production
+
+###################### Zerobus Output ######################
+
+output.zerobus:
+  # Zerobus service endpoint
+  zerobus_uri: "12345.zerobus.region.cloud.databricks.com"
+
+  # Databricks workspace URL
+  workspace_url: "https://workspace.cloud.databricks.com"
+
+  # Target table (catalog.schema.table format)
+  table_name: "catalog.schema.logs"
+
+  # OAuth credentials (use environment variables for security)
+  oauth:
+    client_id: "${OAUTH_CLIENT_ID}"
+    client_secret: "${OAUTH_CLIENT_SECRET}"
+
+  # Performance tuning
+  workers: 4        # Number of concurrent workers
+  batch_size: 2048  # Events per batch
+
+  # Optional: SDK options for advanced tuning
+  # sdk_options:
+  #   max_inflight_requests: 1000000
+  #   recovery: true
+  #   recovery_retries: 4
+  #   flush_timeout_ms: 300000
+
+###################### Logging ######################
+
+logging.level: info
+logging.selectors: ["*"]

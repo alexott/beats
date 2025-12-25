@@ -1,0 +1,37 @@
+# High-throughput Filebeat configuration for Zerobus output
+
+filebeat.inputs:
+  - type: filestream
+    id: high-volume-logs
+    enabled: true
+    paths:
+      - /var/log/app/*.log
+
+    # Optimize for high throughput
+    prospector:
+      scanner:
+        check_interval: 1s
+
+    processors:
+      - add_host_metadata: ~
+
+output.zerobus:
+  zerobus_uri: "12345.zerobus.region.cloud.databricks.com"
+  workspace_url: "https://workspace.cloud.databricks.com"
+  table_name: "catalog.schema.high_volume_logs"
+
+  oauth:
+    client_id: "${OAUTH_CLIENT_ID}"
+    client_secret: "${OAUTH_CLIENT_SECRET}"
+
+  # High-throughput settings
+  workers: 16
+  batch_size: 8192
+
+  # Optimize SDK for high throughput
+  sdk_options:
+    max_inflight_requests: 500000
+    recovery_retries: 10
+    flush_timeout_ms: 600000
+
+logging.level: info
