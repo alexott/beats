@@ -366,22 +366,26 @@ func (o *zerobusOutput) encodeEvent(event *publisher.Event) ([]byte, error) {
 }
 
 // loadProtoDescriptor loads and parses a proto descriptor file
+// Returns: serialized DescriptorProto bytes (for SDK), MessageDescriptor (for encoding), error
 func loadProtoDescriptor(descriptorPath, messageType string) ([]byte, protoreflect.MessageDescriptor, error) {
-	// Load descriptor file
+	// Load descriptor file (FileDescriptorSet)
 	descriptorBytes, err := os.ReadFile(descriptorPath)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to load proto descriptor: %w", err)
 	}
 
-	// Parse descriptor
+	// Parse FileDescriptorSet
 	fileDescSet := &descriptorpb.FileDescriptorSet{}
 	if err := proto.Unmarshal(descriptorBytes, fileDescSet); err != nil {
 		return nil, nil, fmt.Errorf("failed to parse descriptor: %w", err)
 	}
 
-	// Create file registry
+	// Create file registry and find the message
 	files := &protoregistry.Files{}
+	var messageDescriptorProto *descriptorpb.DescriptorProto
+
 	for _, fdProto := range fileDescSet.File {
+		// Register file for runtime use
 		fd, err := protodesc.NewFile(fdProto, files)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create file descriptor: %w", err)
@@ -389,15 +393,37 @@ func loadProtoDescriptor(descriptorPath, messageType string) ([]byte, protorefle
 		if err := files.RegisterFile(fd); err != nil {
 			return nil, nil, fmt.Errorf("failed to register file descriptor: %w", err)
 		}
+
+		// Search for the specific message's DescriptorProto
+		for _, msgProto := range fdProto.MessageType {
+			fullName := fdProto.GetPackage() + "." + msgProto.GetName()
+			if fullName == messageType || msgProto.GetName() == messageType {
+				messageDescriptorProto = msgProto
+				break
+			}
+		}
+		if messageDescriptorProto != nil {
+			break
+		}
 	}
 
-	// Find message descriptor
+	if messageDescriptorProto == nil {
+		return nil, nil, fmt.Errorf("message type %s not found in descriptor", messageType)
+	}
+
+	// Serialize the specific DescriptorProto (this is what SDK expects)
+	descriptorProtoBytes, err := proto.Marshal(messageDescriptorProto)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to serialize DescriptorProto: %w", err)
+	}
+
+	// Get MessageDescriptor for runtime encoding
 	messageDescriptor, err := findMessageDescriptor(files, messageType)
 	if err != nil {
 		return nil, nil, fmt.Errorf("message type %s not found: %w", messageType, err)
 	}
 
-	return descriptorBytes, messageDescriptor, nil
+	return descriptorProtoBytes, messageDescriptor, nil
 }
 
 // findMessageDescriptor searches for a message descriptor by name
