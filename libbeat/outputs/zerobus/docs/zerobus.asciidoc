@@ -1,0 +1,95 @@
+[[zerobus-output]]
+=== Zerobus output
+
+The Zerobus output sends events to Databricks Delta tables using the Zerobus streaming service.
+
+This output uses the Zerobus Go SDK which provides:
+
+* Automatic OAuth 2.0 authentication
+* Built-in retry and stream recovery
+* High-throughput streaming ingestion
+* Support for both JSON and Protocol Buffer formats
+
+==== Example configuration
+
+[source,yaml]
+----
+output.zerobus:
+  zerobus_uri: "12345.zerobus.region.cloud.databricks.com"
+  workspace_url: "https://workspace.cloud.databricks.com"
+  table_name: "catalog.schema.table"
+
+  oauth:
+    client_id: "${OAUTH_CLIENT_ID}"
+    client_secret: "${OAUTH_CLIENT_SECRET}"
+
+  workers: 4
+  batch_size: 2048
+----
+
+==== Configuration options
+
+[float]
+===== `zerobus_uri`
+
+The Zerobus service endpoint. This is typically in the format `<workspace_id>.zerobus.<region>.<cloud>.databricks.com`.
+
+[float]
+===== `workspace_url`
+
+The Databricks workspace URL for OAuth authentication.
+
+[float]
+===== `table_name`
+
+The fully qualified table name in the format `catalog.schema.table`.
+
+[float]
+===== `oauth`
+
+OAuth 2.0 client credentials for authentication.
+
+* `client_id`: The OAuth client ID
+* `client_secret`: The OAuth client secret
+
+[float]
+===== `workers`
+
+Number of concurrent worker goroutines for parallel event ingestion. Default: 4.
+
+[float]
+===== `batch_size`
+
+Number of events to batch together before sending. Default: 2048.
+
+[float]
+===== `record_type`
+
+Record format type: `json` or `proto`. Default: `json`.
+
+[float]
+===== `sdk_options`
+
+Advanced SDK configuration options:
+
+* `max_inflight_requests`: Maximum number of in-flight requests. Default: 1000000.
+* `recovery`: Enable automatic stream recovery. Default: true.
+* `recovery_retries`: Maximum number of recovery attempts. Default: 4.
+* `recovery_timeout_ms`: Timeout for recovery operations in milliseconds. Default: 15000.
+* `recovery_backoff_ms`: Delay between recovery retry attempts in milliseconds. Default: 2000.
+* `flush_timeout_ms`: Timeout for flush operations in milliseconds. Default: 300000.
+* `server_lack_of_ack_timeout_ms`: Timeout waiting for server acknowledgments in milliseconds. Default: 60000.
+
+==== Migration from zerobushttp
+
+The Zerobus output is the recommended replacement for the `zerobushttp` output. To migrate:
+
+1. Change `output.zerobushttp` to `output.zerobus` in your configuration
+2. Configuration options remain the same
+3. The SDK-based implementation provides better reliability and performance
+
+==== Requirements
+
+* CGO must be enabled (CGO_ENABLED=1)
+* Rust toolchain 1.75+ must be installed
+* OAuth 2.0 client credentials with appropriate permissions
