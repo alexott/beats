@@ -20,9 +20,15 @@ package zerobus
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 
 	zerobus "github.com/databricks/zerobus-sdk-go"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
 
 	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/outputs"
@@ -48,6 +54,9 @@ type zerobusOutput struct {
 	// SDK components
 	sdk    *zerobus.ZerobusSdk
 	stream *zerobus.ZerobusStream
+
+	// Proto support
+	messageDescriptor protoreflect.MessageDescriptor
 
 	// Concurrency control
 	workerSem chan struct{}
@@ -111,9 +120,28 @@ func newZerobusOutput(
 		return nil, fmt.Errorf("failed to create SDK: %w", err)
 	}
 
+	// Load proto descriptor if in proto mode
+	var descriptorBytes []byte
+	var messageDescriptor protoreflect.MessageDescriptor
+	if config.RecordType == "proto" {
+		descriptorBytes, messageDescriptor, err = loadProtoDescriptor(
+			config.ProtoDescriptorFile,
+			config.ProtoMessageType,
+		)
+		if err != nil {
+			sdk.Free()
+			return nil, err
+		}
+		log.Infof("Loaded proto descriptor for message type: %s", config.ProtoMessageType)
+	}
+
 	// Configure stream options
 	options := zerobus.DefaultStreamConfigurationOptions()
-	options.RecordType = zerobus.RecordTypeJson
+	if config.RecordType == "proto" {
+		options.RecordType = zerobus.RecordTypeProto
+	} else {
+		options.RecordType = zerobus.RecordTypeJson
+	}
 	options.MaxInflightRequests = config.SDKOptions.MaxInflightRequests
 	options.Recovery = config.SDKOptions.Recovery
 	options.RecoveryRetries = config.SDKOptions.RecoveryRetries
@@ -122,11 +150,17 @@ func newZerobusOutput(
 	options.FlushTimeoutMs = config.SDKOptions.FlushTimeoutMs
 	options.ServerLackOfAckTimeoutMs = config.SDKOptions.ServerLackOfAckTimeoutMs
 
+	// Create table properties
+	tableProps := zerobus.TableProperties{
+		TableName: config.TableName,
+	}
+	if config.RecordType == "proto" {
+		tableProps.DescriptorProto = descriptorBytes
+	}
+
 	// Create long-lived stream
 	stream, err := sdk.CreateStream(
-		zerobus.TableProperties{
-			TableName: config.TableName,
-		},
+		tableProps,
 		config.OAuth.ClientID,
 		config.OAuth.ClientSecret,
 		options,
@@ -140,17 +174,19 @@ func newZerobusOutput(
 	workerSem := make(chan struct{}, config.Workers)
 
 	output := &zerobusOutput{
-		log:       log,
-		config:    config,
-		codec:     codec,
-		observer:  observer,
-		index:     beat.Beat,
-		sdk:       sdk,
-		stream:    stream,
-		workerSem: workerSem,
+		log:               log,
+		config:            config,
+		codec:             codec,
+		observer:          observer,
+		index:             beat.Beat,
+		sdk:               sdk,
+		stream:            stream,
+		messageDescriptor: messageDescriptor,
+		workerSem:         workerSem,
 	}
 
-	log.Infof("Initialized Zerobus output for table: %s (%d workers)", config.TableName, config.Workers)
+	log.Infof("Initialized Zerobus output for table: %s (%d workers, mode: %s)",
+		config.TableName, config.Workers, config.RecordType)
 
 	return output, nil
 }
@@ -285,4 +321,62 @@ func (o *zerobusOutput) Publish(ctx context.Context, batch publisher.Batch) erro
 // String implements the outputs.Client interface
 func (o *zerobusOutput) String() string {
 	return fmt.Sprintf("zerobus(%s)", o.config.TableName)
+}
+
+// loadProtoDescriptor loads and parses a proto descriptor file
+func loadProtoDescriptor(descriptorPath, messageType string) ([]byte, protoreflect.MessageDescriptor, error) {
+	// Load descriptor file
+	descriptorBytes, err := os.ReadFile(descriptorPath)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load proto descriptor: %w", err)
+	}
+
+	// Parse descriptor
+	fileDescSet := &descriptorpb.FileDescriptorSet{}
+	if err := proto.Unmarshal(descriptorBytes, fileDescSet); err != nil {
+		return nil, nil, fmt.Errorf("failed to parse descriptor: %w", err)
+	}
+
+	// Create file registry
+	files := &protoregistry.Files{}
+	for _, fdProto := range fileDescSet.File {
+		fd, err := protodesc.NewFile(fdProto, files)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create file descriptor: %w", err)
+		}
+		if err := files.RegisterFile(fd); err != nil {
+			return nil, nil, fmt.Errorf("failed to register file descriptor: %w", err)
+		}
+	}
+
+	// Find message descriptor
+	messageDescriptor, err := findMessageDescriptor(files, messageType)
+	if err != nil {
+		return nil, nil, fmt.Errorf("message type %s not found: %w", messageType, err)
+	}
+
+	return descriptorBytes, messageDescriptor, nil
+}
+
+// findMessageDescriptor searches for a message descriptor by name
+func findMessageDescriptor(files *protoregistry.Files, messageType string) (protoreflect.MessageDescriptor, error) {
+	var found protoreflect.MessageDescriptor
+
+	files.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
+		messages := fd.Messages()
+		for i := 0; i < messages.Len(); i++ {
+			md := messages.Get(i)
+			if string(md.FullName()) == messageType || string(md.Name()) == messageType {
+				found = md
+				return false // Stop iteration
+			}
+		}
+		return true // Continue iteration
+	})
+
+	if found == nil {
+		return nil, fmt.Errorf("message type %s not found in descriptor", messageType)
+	}
+
+	return found, nil
 }
