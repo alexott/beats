@@ -19,8 +19,10 @@ package zerobus
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 
 	zerobus "github.com/databricks/zerobus-sdk-go"
@@ -35,7 +37,7 @@ import (
 	"github.com/elastic/beats/v7/libbeat/beat"
 	"github.com/elastic/beats/v7/libbeat/outputs"
 	"github.com/elastic/beats/v7/libbeat/outputs/codec"
-	"github.com/elastic/beats/v7/libbeat/outputs/codec/json"
+	codecjson "github.com/elastic/beats/v7/libbeat/outputs/codec/json"
 	"github.com/elastic/beats/v7/libbeat/publisher"
 	"github.com/elastic/elastic-agent-libs/config"
 	"github.com/elastic/elastic-agent-libs/logp"
@@ -89,7 +91,7 @@ func makeZerobus(
 		}
 	} else {
 		// Use default JSON codec
-		enc = json.New(beat.Version, json.Config{
+		enc = codecjson.New(beat.Version, codecjson.Config{
 			Pretty:     false,
 			EscapeHTML: false,
 		})
@@ -338,7 +340,13 @@ func (o *zerobusOutput) encodeEvent(event *publisher.Event) ([]byte, error) {
 		return jsonBytes, nil
 	}
 
-	// Proto mode: Convert JSON → Proto
+	// Proto mode: Transform field names (@ → _) before conversion
+	transformedJSON, err := transformJSONFieldNames(jsonBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to transform JSON field names: %w", err)
+	}
+
+	// Convert JSON → Proto
 	msg := dynamicpb.NewMessage(o.messageDescriptor)
 
 	// Convert JSON → Proto with strict validation
@@ -347,10 +355,10 @@ func (o *zerobusOutput) encodeEvent(event *publisher.Event) ([]byte, error) {
 		DiscardUnknown: false, // Fail on unknown fields
 	}
 
-	if err := unmarshaler.Unmarshal(jsonBytes, msg); err != nil {
+	if err := unmarshaler.Unmarshal(transformedJSON, msg); err != nil {
 		return nil, &ProtoConversionError{
 			Message:      fmt.Sprintf("JSON→Proto conversion failed: %v", err),
-			OriginalJSON: string(jsonBytes),
+			OriginalJSON: string(transformedJSON),
 			MessageType:  o.config.ProtoMessageType,
 			Err:          err,
 		}
@@ -363,6 +371,67 @@ func (o *zerobusOutput) encodeEvent(event *publisher.Event) ([]byte, error) {
 	}
 
 	return protoBytes, nil
+}
+
+// transformJSONFieldNames transforms field names starting with @ to start with _
+// This is needed because protobuf field names cannot start with @ but Beats uses @timestamp, @metadata
+func transformJSONFieldNames(jsonBytes []byte) ([]byte, error) {
+	var data map[string]interface{}
+	if err := json.Unmarshal(jsonBytes, &data); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+	}
+
+	transformed := transformMap(data)
+
+	result, err := json.Marshal(transformed)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal transformed JSON: %w", err)
+	}
+
+	return result, nil
+}
+
+// transformMap recursively transforms map keys starting with @ to start with _
+func transformMap(m map[string]interface{}) map[string]interface{} {
+	result := make(map[string]interface{}, len(m))
+
+	for key, value := range m {
+		// Transform the key: @ → _
+		newKey := key
+		if strings.HasPrefix(key, "@") {
+			newKey = "_" + strings.TrimPrefix(key, "@")
+		}
+
+		// Recursively transform nested maps and slices
+		switch v := value.(type) {
+		case map[string]interface{}:
+			result[newKey] = transformMap(v)
+		case []interface{}:
+			result[newKey] = transformSlice(v)
+		default:
+			result[newKey] = value
+		}
+	}
+
+	return result
+}
+
+// transformSlice recursively transforms maps within slices
+func transformSlice(s []interface{}) []interface{} {
+	result := make([]interface{}, len(s))
+
+	for i, item := range s {
+		switch v := item.(type) {
+		case map[string]interface{}:
+			result[i] = transformMap(v)
+		case []interface{}:
+			result[i] = transformSlice(v)
+		default:
+			result[i] = item
+		}
+	}
+
+	return result
 }
 
 // loadProtoDescriptor loads and parses a proto descriptor file

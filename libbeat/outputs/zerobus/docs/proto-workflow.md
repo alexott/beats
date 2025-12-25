@@ -42,9 +42,28 @@ message LogEvent {
 **Best Practices:**
 - Use `proto3` syntax (required by Zerobus)
 - Field names should match your JSON event structure
+- **Important**: Use `_` prefix instead of `@` for Beats built-in fields (see Field Name Transformation below)
 - Use appropriate proto types (string, int64, double, bool, etc.)
 - Consider using `map<>` for dynamic key-value pairs
 - Add comments describing each field's purpose
+
+**Field Name Transformation:**
+
+Beats uses field names starting with `@` (like `@timestamp` and `@metadata`), but protobuf field names cannot start with special characters. The Zerobus output **automatically transforms** these fields during proto conversion:
+
+- `@timestamp` → `_timestamp`
+- `@metadata` → `_metadata`
+- Any field starting with `@` → starts with `_`
+
+This transformation is recursive and applies to all nested objects and arrays. In your proto schema, use the underscore prefix:
+
+```proto
+message LogEvent {
+  string _timestamp = 1;    // Matches @timestamp from Beats
+  string _metadata = 2;     // Matches @metadata from Beats
+  string message = 3;       // Regular fields remain unchanged
+}
+```
 
 ## Step 2: Generate Proto Descriptor
 
@@ -235,6 +254,22 @@ processors:
 2. Add fields to your proto schema and regenerate descriptor
 
 3. Use `map<string, string>` in proto for dynamic fields
+
+#### Error: "unknown field @timestamp" or "unknown field @metadata"
+
+**Cause:** Proto schema uses `@` prefix instead of `_` prefix
+
+**Solution:**
+The Zerobus output automatically transforms `@` to `_` in field names. Ensure your proto schema uses the underscore prefix:
+
+```proto
+message LogEvent {
+  string _timestamp = 1;  // NOT @timestamp
+  string _metadata = 2;   // NOT @metadata
+}
+```
+
+**Note:** This transformation is automatic - you don't need processors. The output handles it during JSON→Proto conversion.
 
 #### Error: "JSON→Proto conversion failed: missing required field"
 
